@@ -28,14 +28,47 @@ private struct WindowRecord {
 }
 
 @MainActor private final class WindowStore {
+    let screenshotBackground = CGColor(red: 0, green: 0, blue: 0, alpha: 0)
     var records: [CGWindowID: WindowRecord] = [:]
-    var images = ThumbnailCache<NSImage>(capacity: 96)
+    var images = ThumbnailCache<NSImage>(capacity: 96, byteLimit: 24 * 1024 * 1024)
     var order = WindowOrder()
     var observers: [pid_t: AXObserver] = [:]
     var observedWindows: [pid_t: [AXUIElement]] = [:]
     var refreshing = false
     var captureBusy = false
     var onChange: (() -> Void)?
+    var thumbnailWidth: CGFloat = 230
+    var lastInventory = Date.distantPast
+    var inventoryPending = false
+    var captureQueue: [CGWindowID: CGFloat] = [:]
+    var captureThrottle = WorkThrottle()
+    var inventoryCount = 0
+    var captureCount = 0
+    var suspended = false
+
+    func refreshFocusedThumbnail() async {
+        guard let id = order.lastFocused, let record = records[id],
+              let app = NSWorkspace.shared.frontmostApplication,
+              shouldRefreshForegroundThumbnail(suspended: suspended, busy: captureBusy, minimized: record.minimized,
+                                               owner: record.pid, frontmost: app.processIdentifier, hidden: app.isHidden) else { return }
+        await capture([id], width: thumbnailWidth)
+    }
+
+    func clearPrivateCache() {
+        images.removeAll(); records.removeAll(); captureQueue.removeAll()
+        order.prune(live: [])
+        lastInventory = .distantPast
+        onChange?()
+    }
+
+    func warmMissing(pid: pid_t? = nil) async {
+        let ids = order.sorted(records.values.filter {
+            (pid == nil || $0.pid == pid) && !$0.minimized && $0.window.isOnScreen && images[$0.id] == nil
+        }.map(\.id))
+        let estimatedBytes = max(1, Int(thumbnailWidth * 2) * Int(thumbnailWidth * 2 * 0.64) * 4)
+        let warmCount = min(96, max(1, images.byteLimit / estimatedBytes))
+        await capture(Array(ids.prefix(warmCount)), width: thumbnailWidth)
+    }
 
     func match(_ element: AXUIElement, pid: pid_t) -> CGWindowID? {
         let title: String = ax(element, kAXTitleAttribute) ?? ""
@@ -57,25 +90,29 @@ private struct WindowRecord {
     func event(_ element: AXUIElement, notification: String) {
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
-        if notification == kAXWindowMiniaturizedNotification || notification == kAXFocusedWindowChangedNotification {
+        if notification == kAXWindowMiniaturizedNotification || notification == kAXFocusedWindowChangedNotification || notification == kAXWindowDeminiaturizedNotification {
             let target: AXUIElement = notification == kAXFocusedWindowChangedNotification
                 ? (ax(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute) ?? element) : element
             if let id = match(target, pid: pid) {
                 if notification == kAXWindowMiniaturizedNotification {
                     order.minimize(id, pid: pid, frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier, time: Date.timeIntervalSinceReferenceDate)
-                } else {
+                } else if notification == kAXFocusedWindowChangedNotification {
                     order.focus(id, pid: pid, time: Date.timeIntervalSinceReferenceDate)
                 }
+                if notification != kAXFocusedWindowChangedNotification, let old = records[id] {
+                    records[id] = WindowRecord(id: id, pid: old.pid, window: old.window, element: old.element, minimized: notification == kAXWindowMiniaturizedNotification)
+                }
+                images.prioritize(id, value: order.recency[id, default: 0])
                 onChange?()
+                if notification != kAXWindowMiniaturizedNotification, images[id] == nil {
+                    Task { await capture([id], width: thumbnailWidth) }
+                }
+                return
             }
         }
         Task {
-            await refresh()
-            if notification == kAXFocusedWindowChangedNotification || notification == kAXWindowCreatedNotification {
-                if let front = NSWorkspace.shared.frontmostApplication {
-                    await capture(windows(for: front.processIdentifier).filter { !$0.minimized }.map(\.id), width: 420)
-                }
-            }
+            await refresh(force: true)
+            await warmMissing(pid: pid)
         }
     }
 
@@ -108,10 +145,21 @@ private struct WindowRecord {
         observedWindows[pid] = windows
     }
 
-    func refresh() async {
-        guard !refreshing, AXIsProcessTrusted(), CGPreflightScreenCaptureAccess() else { return }
+    func refresh(force: Bool = false) async {
+        guard !suspended else { return }
+        guard AXIsProcessTrusted(), CGPreflightScreenCaptureAccess() else { clearPrivateCache(); return }
+        if refreshing { if force { inventoryPending = true }; return }
+        guard force || Date().timeIntervalSince(lastInventory) >= 2 else { return }
         refreshing = true
-        defer { refreshing = false }
+        lastInventory = Date()
+        inventoryCount += 1
+        defer {
+            refreshing = false
+            if inventoryPending {
+                inventoryPending = false
+                Task { await refresh(force: true); await warmMissing() }
+            }
+        }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
             var next: [CGWindowID: WindowRecord] = [:]
@@ -154,11 +202,15 @@ private struct WindowRecord {
                 observers.removeValue(forKey: pid)
                 observedWindows.removeValue(forKey: pid)
             }
+            let changed = Set(records.keys) != Set(next.keys) || next.contains { id, record in
+                records[id]?.minimized != record.minimized || records[id]?.window.frame != record.window.frame
+            }
             records = next
             images.prune(live: Set(next.keys))
             order.prune(live: Set(next.keys))
+            captureThrottle.prune(live: Set(next.keys))
             sampleFocus()
-            onChange?()
+            if changed { onChange?() }
         } catch {
             NSLog("GlassDock: window inventory unavailable: %@", error.localizedDescription)
         }
@@ -169,6 +221,7 @@ private struct WindowRecord {
         let element: AXUIElement? = ax(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute)
         if let element, let id = match(element, pid: app.processIdentifier), id != order.lastFocused {
             order.focus(id, pid: app.processIdentifier, time: Date.timeIntervalSinceReferenceDate)
+            images.prioritize(id, value: order.recency[id, default: 0])
             onChange?()
         }
     }
@@ -186,6 +239,7 @@ private struct WindowRecord {
             let role: String = ax(element, kAXRoleAttribute) ?? ""
             if role == kAXWindowRole, let id = match(element, pid: pid) {
                 order.explicitInput(clickedWindow: id)
+                images.prioritize(id, value: order.recency[id, default: 0])
                 onChange?()
                 return
             }
@@ -196,23 +250,31 @@ private struct WindowRecord {
     }
 
     func capture(_ ids: [CGWindowID], width: CGFloat) async {
-        guard !captureBusy, CGPreflightScreenCaptureAccess() else { return }
+        guard !suspended else { return }
+        guard CGPreflightScreenCaptureAccess(), AXIsProcessTrusted() else { clearPrivateCache(); return }
+        for id in ids { captureQueue[id] = max(captureQueue[id] ?? 0, width) }
+        guard !captureBusy else { return }
         captureBusy = true
-        defer { captureBusy = false }
-        for id in ids {
+        defer { captureBusy = false; onChange?() }
+        while let id = order.sorted(Array(captureQueue.keys)).first {
+            guard !suspended else { break }
+            let width = captureQueue.removeValue(forKey: id)!
             guard let record = records[id], !record.minimized else { continue }
+            guard captureThrottle.allow(id, at: Date.timeIntervalSinceReferenceDate, interval: 0.7) else { continue }
             let configuration = SCStreamConfiguration()
-            let aspect = record.window.frame.height / max(1, record.window.frame.width)
             configuration.width = Int(width * 2)
-            configuration.height = max(1, min(700, Int(width * 2 * aspect)))
+            configuration.height = max(1, Int(width * 2 * 0.64))
+            configuration.backgroundColor = screenshotBackground
             configuration.showsCursor = false
             configuration.scalesToFit = true
             configuration.ignoreShadowsSingleWindow = true
             let filter = SCContentFilter(desktopIndependentWindow: record.window)
+            captureCount += 1
             do {
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-                guard records[id] != nil else { continue }
-                images[id] = NSImage(cgImage: image, size: .zero)
+                guard !suspended, let current = records[id], current.pid == record.pid, !current.minimized,
+                      CGPreflightScreenCaptureAccess(), AXIsProcessTrusted() else { continue }
+                images.insert(NSImage(cgImage: image, size: .zero), for: id, bytes: image.bytesPerRow * image.height, priority: order.recency[id, default: 0])
             } catch { /* Retain the last good thumbnail during transient/minimize races. */ }
         }
     }
@@ -229,6 +291,7 @@ private struct WindowRecord {
         AXUIElementSetAttributeValue(AXUIElementCreateApplication(record.pid), kAXFocusedWindowAttribute as CFString, element)
         order.explicitInput()
         order.focus(id, pid: record.pid, time: Date.timeIntervalSinceReferenceDate)
+        images.prioritize(id, value: order.recency[id, default: 0])
     }
 
     @discardableResult func close(_ id: CGWindowID) -> Bool {
@@ -332,7 +395,19 @@ private struct WindowRecord {
     var closeSideControl: NSSegmentedControl?
     var timer: Timer?
     var cacheTimer: Timer?
+    var focusedCaptureTimer: Timer?
     var mouseMonitor: Any?
+    var motionMonitor: Any?
+    var localMotionMonitor: Any?
+    var dockOrientation = "bottom"
+    var sleeping = false
+    var cachedDockPoint = CGPoint(x: CGFloat.infinity, y: CGFloat.infinity)
+    var cachedDockTarget: (pid_t, CGRect)?
+    var dockProbeBudget = DockProbeBudget()
+    var lastDockLookup = Date.distantPast
+    var dockLookupCount = 0
+    var pointerPollCount = 0
+    var lastPermissionCheck = Date.distantPast
     var hoveredPID: pid_t?
     var dockRect = CGRect.zero
     var hoverBegan = Date.distantPast
@@ -371,33 +446,90 @@ private struct WindowRecord {
         NSApp.mainMenu = mainMenu
         store.onChange = { [weak self] in
             guard let self, self.previewVisible, !self.demo else { return }
-            self.renderCurrent(force: true)
+            // Inventory/capture completion only paints; it must never enqueue another capture cycle.
+            if let pid = self.hoveredPID { self.presentCached(pid: pid) }
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.poll() }
-        }
-        cacheTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        store.thumbnailWidth = previewWidth
+        updateDockOrientation()
+        cacheTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                Task {
-                    await self.store.refresh()
-                    // Cache visible windows before they minimize. Memory only; no screenshot files.
-                    let ids = self.store.order.sorted(self.store.records.values.filter { !$0.minimized && $0.window.isOnScreen }.map(\.id))
-                    await self.store.capture(Array(ids.prefix(96)), width: self.previewWidth)
+                guard !self.sleeping else { return }
+                self.updateDockOrientation()
+                if !AXIsProcessTrusted() || !CGPreflightScreenCaptureAccess() { self.store.clearPrivateCache(); self.hidePreview() }
+                self.store.sampleFocus()
+                if CommandLine.arguments.contains("--metrics") {
+                    let line = "GlassDock metrics: inventory=\(self.store.inventoryCount) captures=\(self.store.captureCount) dockAX=\(self.dockLookupCount) pointerPolls=\(self.pointerPollCount) cacheImages=\(self.store.images.count) cacheBytes=\(self.store.images.byteCount)\n"
+                    FileHandle.standardError.write(Data(line.utf8))
                 }
             }
         }
+        focusedCaptureTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.sleeping else { return }
+                Task { await self.store.refreshFocusedThumbnail() }
+            }
+        }
+        focusedCaptureTimer?.tolerance = 0.3
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(activeAppChanged), name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appLaunched), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appTerminated), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             MainActor.assumeIsolated { self?.store.explicitClick() }
+        }
+        motionMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged]) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pointerChanged() }
+        }
+        localMotionMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged]) { [weak self] event in
+            self?.pointerChanged()
+            return event
         }
         if CommandLine.arguments.contains("--demo") { showDemo() }
         else if !AXIsProcessTrusted() || !CGPreflightScreenCaptureAccess() { showPermissions() }
         else if !CommandLine.arguments.contains("--background") { showSettings() }
-        Task { await store.refresh() }
+        Task { await store.refresh(force: true); await store.warmMissing() }
+        pointerChanged()
     }
 
-    @objc func activeAppChanged() { store.sampleFocus(); Task { await store.refresh() } }
+    @objc func activeAppChanged() {
+        store.sampleFocus()
+        Task { await store.refresh(); await store.warmMissing(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier) }
+    }
+    @objc func appLaunched(_ notification: Notification) {
+        if let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+            store.installObserver(application.processIdentifier, windows: [])
+        }
+        Task { await store.refresh(force: true); await store.warmMissing() }
+    }
+    @objc func appTerminated() { cachedDockTarget = nil; Task { await store.refresh(force: true) } }
+    @objc func willSleep() { sleeping = true; store.suspended = true; store.captureQueue.removeAll(); hidePreview(); timer?.invalidate(); timer = nil }
+    @objc func didWake() { sleeping = false; store.suspended = false; screensChanged(); Task { await store.refresh(force: true); await store.warmMissing() } }
+    @objc func screensChanged() { cachedDockTarget = nil; updateDockOrientation(); hidePreview(); pointerChanged() }
+    func updateDockOrientation() {
+        dockOrientation = CFPreferencesCopyAppValue("orientation" as CFString, "com.apple.dock" as CFString) as? String ?? "bottom"
+    }
+
+    func pointerChanged() {
+        guard !sleeping else { return }
+        let point = NSEvent.mouseLocation
+        if point != cachedDockPoint { dockProbeBudget.reset() }
+        let nearAnyEdge = NSScreen.screens.contains { screen in
+            ["bottom", "left", "right"].contains { nearDockEdge(point, screen: screen.frame, orientation: $0) }
+        }
+        if demo || previewVisible || hoveredPID != nil || nearAnyEdge {
+            if timer == nil {
+                let t = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.poll() } }
+                t.tolerance = 0.003
+                RunLoop.main.add(t, forMode: .common)
+                timer = t
+            }
+        } else {
+            timer?.invalidate(); timer = nil
+        }
+    }
     @objc func quitApp() { NSApp.terminate(nil) }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -406,6 +538,12 @@ private struct WindowRecord {
     }
 
     func dockTarget(at point: CGPoint) -> (pid_t, CGRect)? {
+        if point == cachedDockPoint, let cachedDockTarget { return cachedDockTarget }
+        if point == cachedDockPoint, Date().timeIntervalSince(lastDockLookup) < 0.12 { return nil }
+        cachedDockPoint = point
+        cachedDockTarget = nil
+        lastDockLookup = Date()
+        dockLookupCount += 1
         guard AXIsProcessTrusted(), let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return nil }
         let flipped = CGPoint(x: point.x, y: (NSScreen.screens.first?.frame.maxY ?? 0) - point.y)
         var hit: AXUIElement?
@@ -420,7 +558,9 @@ private struct WindowRecord {
                     $0.processIdentifier != getpid() && ($0.bundleURL == url || (url == nil && $0.localizedName == title))
                 }
                 guard candidates.count == 1, let rect = axRect(element) else { return nil }
-                return (candidates[0].processIdentifier, cocoaRect(rect))
+                let result = (candidates[0].processIdentifier, cocoaRect(rect))
+                cachedDockTarget = result
+                return result
             }
             guard let parent: AXUIElement = ax(element, kAXParentAttribute) else { break }
             element = parent
@@ -429,15 +569,29 @@ private struct WindowRecord {
     }
 
     func poll() {
+        pointerPollCount += 1
         let point = NSEvent.mouseLocation
         if demo {
             if Date() > demoExpires && !previewGroupContains(point, frames: previewFrames) { hidePreview() }
             return
         }
-        store.sampleFocus()
-        if previewGroupContains(point, frames: previewFrames) { return }
-        if previewFrames.contains(where: { isPreviewBridge(point, icon: dockRect, preview: $0) }) { return }
-        if let (pid, rect) = dockTarget(at: point),
+        if Date().timeIntervalSince(lastPermissionCheck) >= 1 {
+            lastPermissionCheck = Date()
+            if !AXIsProcessTrusted() || !CGPreflightScreenCaptureAccess() {
+                store.clearPrivateCache(); hidePreview(); timer?.invalidate(); timer = nil
+                return
+            }
+        }
+        if previewGroupContains(point, frames: previewFrames) { renderCurrent(); return }
+        if previewFrames.contains(where: { isPreviewBridge(point, icon: dockRect, preview: $0) }) { renderCurrent(); return }
+        if hoveredPID == nil { updateDockOrientation() }
+        guard NSScreen.screens.contains(where: { nearDockEdge(point, screen: $0.frame, orientation: dockOrientation) }) else {
+            if hoveredPID != nil { hidePreview() }
+            timer?.invalidate(); timer = nil
+            return
+        }
+        let target = dockTarget(at: point)
+        if let (pid, rect) = target,
            isDockPreviewTrigger(point, icon: rect) || (previewVisible && hoveredPID == pid) {
             dockRect = rect
             if hoveredPID != pid {
@@ -452,6 +606,9 @@ private struct WindowRecord {
             return
         }
         if hoveredPID != nil { hidePreview() }
+        if !dockProbeBudget.retry(targetExists: target != nil, at: Date.timeIntervalSinceReferenceDate) {
+            timer?.invalidate(); timer = nil
+        }
     }
 
     func hidePreview() {
@@ -460,6 +617,8 @@ private struct WindowRecord {
         hoveredPID = nil
         renderedIDs = []
         demo = false
+        cachedDockTarget = nil
+        cachedDockPoint = CGPoint(x: CGFloat.infinity, y: CGFloat.infinity)
     }
 
     func renderCurrent(force: Bool = false) {
@@ -475,7 +634,11 @@ private struct WindowRecord {
         Task {
             await store.refresh()
             let windows = store.windows(for: pid)
-            await store.capture(windows.map(\.id), width: previewWidth)
+            let screen = NSScreen.screens.first(where: { $0.frame.intersects(dockRect) }) ?? NSScreen.main
+            let actualWidth = screen.map {
+                separatePreviewFrames(count: windows.count, width: previewWidth, visible: $0.visibleFrame.insetBy(dx: 8, dy: 8), anchor: dockRect, orientation: dockOrientation).first?.width ?? previewWidth
+            } ?? previewWidth
+            await store.capture(windows.map(\.id), width: max(1, actualWidth - 4))
             defer { rendering = false }
             guard generation == token, hoveredPID == pid else { return }
             presentCached(pid: pid)
@@ -550,6 +713,7 @@ private struct WindowRecord {
     @objc func showDemo() {
         hidePreview()
         demo = true
+        pointerChanged()
         demoExpires = Date().addingTimeInterval(18)
         demoItems = [PreviewItem(id: 101, content: demoImage(.systemBlue, alternate: false), minimized: false), PreviewItem(id: 102, content: demoImage(.systemPurple, alternate: true), minimized: true)]
         let screen = NSScreen.main ?? NSScreen.screens[0]
@@ -628,7 +792,7 @@ private struct WindowRecord {
         closeSide.setAccessibilityLabel("Угол крестика закрытия")
         closeSideControl = closeSide
         stack.addArrangedSubview(closeSide)
-        let hint = label("Последнее открытое или свёрнутое окно всегда первым. Содержимое свёрнутых окон появляется после первого открытия; кеш хранит до 96 окон только в памяти.")
+        let hint = label("Последнее открытое или свёрнутое окно всегда первым. Содержимое свёрнутых окон появляется после первого открытия; кеш — до 96 окон и 24 МБ только в памяти.")
         hint.textColor = .secondaryLabelColor
         stack.addArrangedSubview(hint)
         w.contentView?.addSubview(stack)
@@ -647,6 +811,7 @@ private struct WindowRecord {
         guard let sizeSlider, let opacitySlider else { return }
         UserDefaults.standard.set(sizeSlider.doubleValue, forKey: "previewWidth")
         UserDefaults.standard.set(opacitySlider.doubleValue, forKey: "previewOpacity")
+        store.thumbnailWidth = previewWidth
         if let closeSideControl {
             UserDefaults.standard.set(closeSideControl.selectedSegment == 0 ? "left" : "right", forKey: "closeButtonSide")
         }
