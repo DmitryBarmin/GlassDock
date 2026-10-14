@@ -1,0 +1,14 @@
+/build/
+/dist/
+/.build/
+/.swiftpm/
+.DS_Store
+xcuserdata/
+*.xcuserstate
+/userdata/
+/runtime/
+/Assets/
+/history.json
+.env
+.env.*
+*.log
