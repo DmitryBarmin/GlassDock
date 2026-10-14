@@ -8,6 +8,15 @@ private func ax<T>(_ element: AXUIElement, _ name: String) -> T? {
     return result as? T
 }
 
+// Private but long-stable AX SPI (used by AltTab, DockDoor): the window server ID of an AX window.
+// Geometry/title matching cannot tell apart stacked windows with equal frames and titles.
+@_silgen_name("_AXUIElementGetWindow") private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+private func axWindowID(_ element: AXUIElement) -> CGWindowID? {
+    var id: CGWindowID = 0
+    return _AXUIElementGetWindow(element, &id) == .success && id != 0 ? id : nil
+}
+
 private func axRect(_ element: AXUIElement) -> CGRect? {
     guard let p: AXValue = ax(element, kAXPositionAttribute), let s: AXValue = ax(element, kAXSizeAttribute) else { return nil }
     var point = CGPoint.zero, size = CGSize.zero
@@ -71,6 +80,7 @@ private struct WindowRecord {
     }
 
     func match(_ element: AXUIElement, pid: pid_t) -> CGWindowID? {
+        if let id = axWindowID(element), records[id]?.pid == pid { return id }
         let title: String = ax(element, kAXTitleAttribute) ?? ""
         let rect = axRect(element)
         let candidates = records.values.filter { $0.pid == pid }
@@ -176,6 +186,11 @@ private struct WindowRecord {
                     guard let rect = axRect(element) else { continue }
                     let title: String = ax(element, kAXTitleAttribute) ?? ""
                     let candidates = windows.filter { !used.contains($0.windowID) }
+                    if let id = axWindowID(element), let window = candidates.first(where: { $0.windowID == id }) {
+                        used.insert(id)
+                        next[id] = WindowRecord(id: id, pid: pid, window: window, element: element, minimized: ax(element, kAXMinimizedAttribute) ?? false)
+                        continue
+                    }
                     let sameFrame = candidates.filter {
                         abs($0.frame.minX - rect.minX) < 3 && abs($0.frame.minY - rect.minY) < 3 &&
                         abs($0.frame.width - rect.width) < 3 && abs($0.frame.height - rect.height) < 3
