@@ -1,6 +1,12 @@
 import AppKit
 import ApplicationServices
 import ScreenCaptureKit
+import Combine
+
+private let glassDockUpdateConfiguration = AppUpdater.Configuration(
+    repository: "DmitryBarmin/GlassDock", appName: "GlassDock",
+    bundleIdentifier: "local.glassdock.app", relaunchArguments: ["--background"]
+)
 
 private func ax<T>(_ element: AXUIElement, _ name: String) -> T? {
     var result: CFTypeRef?
@@ -397,6 +403,11 @@ private struct WindowRecord {
 
 @MainActor private final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = WindowStore()
+    let updater = AppUpdater(configuration: glassDockUpdateConfiguration)
+    var updateObservation: AnyCancellable?
+    var updateButton: NSButton?
+    var updateStatus: NSTextField?
+    var updateProgress: NSProgressIndicator?
     var panels: [PreviewPanel] = []
     var previewVisible: Bool { panels.contains { $0.isVisible } }
     var previewFrames: [CGRect] { panels.filter { $0.isVisible }.map(\.frame) }
@@ -444,7 +455,7 @@ private struct WindowRecord {
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: "GlassDock")
         let menu = NSMenu()
-        for (title, selector) in [("Настройки…", #selector(showSettings)), ("Доступы macOS…", #selector(showPermissions)), ("Показать демо", #selector(showDemo))] {
+        for (title, selector) in [("Настройки…", #selector(showSettings)), ("Обновить…", #selector(updateApp)), ("Доступы macOS…", #selector(showPermissions)), ("Показать демо", #selector(showDemo))] {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
             item.target = self
             menu.addItem(item)
@@ -779,7 +790,21 @@ private struct WindowRecord {
 
     @objc func showSettings() {
         if let settingsWindow { settingsWindow.makeKeyAndOrderFront(nil); NSApp.activate(); return }
-        let w = window(title: "GlassDock", width: 420, height: 440)
+        let w = window(title: "GlassDock", width: 420, height: 580)
+        w.styleMask.insert(.resizable)
+        w.contentMinSize = NSSize(width: 380, height: 360)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        w.contentView?.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor)
+        ])
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -810,16 +835,66 @@ private struct WindowRecord {
         let hint = label("Последнее открытое или свёрнутое окно всегда первым. Содержимое свёрнутых окон появляется после первого открытия; кеш — до 96 окон и 24 МБ только в памяти.")
         hint.textColor = .secondaryLabelColor
         stack.addArrangedSubview(hint)
-        w.contentView?.addSubview(stack)
-        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor), stack.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor), stack.topAnchor.constraint(equalTo: w.contentView!.topAnchor)])
-        size.widthAnchor.constraint(equalToConstant: 370).isActive = true
-        opacity.widthAnchor.constraint(equalToConstant: 370).isActive = true
-        for view in stack.arrangedSubviews where view is NSTextField {
-            view.widthAnchor.constraint(equalToConstant: 370).isActive = true
+        let separator = NSBox()
+        separator.boxType = .separator
+        stack.addArrangedSubview(separator)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+        let updateRow = NSStackView()
+        updateRow.orientation = .horizontal
+        updateRow.alignment = .centerY
+        updateRow.spacing = 16
+        updateRow.addArrangedSubview(label("GlassDock \(version)", size: 14, weight: .semibold))
+        updateRow.addArrangedSubview(NSView())
+        let updateButton = NSButton(title: "Обновить", target: self, action: #selector(updateApp))
+        updateButton.bezelStyle = .rounded
+        updateRow.addArrangedSubview(updateButton)
+        self.updateButton = updateButton
+        stack.addArrangedSubview(updateRow)
+        let updateStatus = label(updater.status, size: 12)
+        updateStatus.textColor = .secondaryLabelColor
+        self.updateStatus = updateStatus
+        stack.addArrangedSubview(updateStatus)
+        let progress = NSProgressIndicator()
+        progress.style = .bar
+        progress.minValue = 0
+        progress.maxValue = 1
+        self.updateProgress = progress
+        stack.addArrangedSubview(progress)
+        scroll.documentView = stack
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+        for view in [size, opacity, separator, updateRow, progress] {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -50).isActive = true
         }
+        for view in stack.arrangedSubviews where view is NSTextField {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -50).isActive = true
+        }
+        updateObservation = Publishers.CombineLatest3(updater.$status, updater.$busy, updater.$progress)
+            .sink { [weak self] status, busy, progress in
+                self?.refreshUpdate(status: status, busy: busy, progress: progress)
+            }
         settingsWindow = w
         w.makeKeyAndOrderFront(nil)
         NSApp.activate()
+    }
+
+    func refreshUpdate(status: String, busy: Bool, progress: Double?) {
+        updateButton?.isEnabled = !busy
+        updateStatus?.stringValue = status
+        updateProgress?.isHidden = !busy
+        updateProgress?.isIndeterminate = progress == nil
+        if let progress { updateProgress?.doubleValue = progress }
+        if busy { updateProgress?.startAnimation(nil) }
+        else { updateProgress?.stopAnimation(nil) }
+    }
+
+    @objc func updateApp() {
+        showSettings()
+        updater.update()
     }
 
     @objc func settingsChanged() {
@@ -873,7 +948,9 @@ private struct WindowRecord {
     }
 }
 
-if CommandLine.arguments.contains("--self-test") {
+if AppUpdater.runHelperIfRequested(configuration: glassDockUpdateConfiguration) {
+    // The update helper finishes before the normal application is created.
+} else if CommandLine.arguments.contains("--self-test") {
     runSelfTests()
 } else if CommandLine.arguments.contains("--diagnostics") {
     print("GlassDock diagnostics")

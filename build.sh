@@ -12,7 +12,7 @@ if [[ $# -gt 0 ]]; then
 fi
 mkdir -p build/GlassDock.app/Contents/MacOS build/GlassDock.app/Contents/Resources
 xcrun swiftc -swift-version 6 -O -target arm64-apple-macos26.0 \
-  main.swift WindowOrder.swift -o build/GlassDock.app/Contents/MacOS/GlassDock \
+  main.swift WindowOrder.swift AppUpdater.swift -o build/GlassDock.app/Contents/MacOS/GlassDock \
   -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit
 cat > build/GlassDock.app/Contents/Info.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,8 +22,8 @@ cat > build/GlassDock.app/Contents/Info.plist <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.glassdock.app</string>
   <key>CFBundleName</key><string>GlassDock</string>
   <key>CFBundleDisplayName</key><string>GlassDock</string>
-  <key>CFBundleVersion</key><string>3</string>
-  <key>CFBundleShortVersionString</key><string>1.2</string>
+  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>1.3</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
