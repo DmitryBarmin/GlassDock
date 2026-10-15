@@ -1,5 +1,23 @@
 import Foundation
 
+func matchingWindow<Value>(in candidates: [Value], nativeID: UInt32?, frame: CGRect?, title: String,
+                           id: (Value) -> UInt32, geometry: (Value) -> CGRect, name: (Value) -> String?) -> Value? {
+    if let nativeID, let exact = candidates.first(where: { id($0) == nativeID }) { return exact }
+    if let frame {
+        let geometric = candidates.filter {
+            let candidate = geometry($0)
+            return abs(candidate.minX - frame.minX) < 3 && abs(candidate.minY - frame.minY) < 3 &&
+                abs(candidate.width - frame.width) < 3 && abs(candidate.height - frame.height) < 3
+        }
+        let named = geometric.filter { name($0) == title }
+        if named.count > 1 { return nil }
+        if named.count == 1 { return named[0] }
+        if geometric.count == 1 { return geometric[0] }
+    }
+    let named = candidates.filter { name($0) == title && !title.isEmpty }
+    return named.count == 1 ? named[0] : nil
+}
+
 func separatePreviewFrames(count: Int, width: CGFloat, visible: CGRect, anchor: CGRect, orientation: String) -> [CGRect] {
     guard count > 0 else { return [] }
     let gap: CGFloat = 6
@@ -193,6 +211,20 @@ func shouldRefreshForegroundThumbnail(suspended: Bool, busy: Bool, minimized: Bo
 }
 
 func runSelfTests() {
+    struct MatchFixture { let id: UInt32; let frame: CGRect; let title: String }
+    let matchingFrame = CGRect(x: 10, y: 20, width: 500, height: 400)
+    let duplicates = [MatchFixture(id: 1, frame: matchingFrame, title: "Untitled"), MatchFixture(id: 2, frame: matchingFrame, title: "Untitled")]
+    func matched(_ fixtures: [MatchFixture], nativeID: UInt32? = nil, frame: CGRect? = matchingFrame, title: String = "Untitled") -> UInt32? {
+        matchingWindow(in: fixtures, nativeID: nativeID, frame: frame, title: title, id: { $0.id }, geometry: { $0.frame }, name: { $0.title })?.id
+    }
+    precondition(matched(duplicates) == nil, "Ambiguous title and frame must not select another window")
+    precondition(matched(duplicates, nativeID: 2) == 2)
+    precondition(matched(duplicates, nativeID: 99) == nil)
+    precondition(matched([duplicates[0]]) == 1)
+    precondition(matched([duplicates[0]], title: "Changed title") == 1)
+    precondition(matched([duplicates[0]], frame: nil) == 1)
+    precondition(matched([duplicates[0], MatchFixture(id: 2, frame: matchingFrame, title: "Other")], title: "Other") == 2)
+    precondition(matched(duplicates, frame: nil) == nil)
     var order = WindowOrder()
     order.touch(11) // focus
     order.touch(22) // minimize
@@ -308,5 +340,5 @@ func runSelfTests() {
     precondition(!probe.retry(targetExists: true, at: 1.6))
     probe.reset()
     precondition(probe.retry(targetExists: false, at: 2))
-    print("PASS: 66 checks — preview/MRU/close regressions, byte-bound priority cache, capture throttle, bounded idle Dock probes and focused-only refresh lifecycle")
+    print("PASS: 74 checks — unambiguous window matching, preview/MRU/close regressions, byte-bound priority cache, capture throttle, bounded idle Dock probes and focused-only refresh lifecycle")
 }

@@ -91,16 +91,8 @@ private struct WindowRecord {
         let rect = axRect(element)
         let candidates = records.values.filter { $0.pid == pid }
         if let exact = candidates.first(where: { $0.element.map { CFEqual($0, element) } ?? false }) { return exact.id }
-        if let rect {
-            let geometric = candidates.filter {
-                abs($0.window.frame.minX - rect.minX) < 3 && abs($0.window.frame.minY - rect.minY) < 3 &&
-                abs($0.window.frame.width - rect.width) < 3 && abs($0.window.frame.height - rect.height) < 3
-            }
-            if let named = geometric.first(where: { $0.window.title == title }) { return named.id }
-            if geometric.count == 1 { return geometric[0].id }
-        }
-        let named = candidates.filter { $0.window.title == title && !title.isEmpty }
-        return named.count == 1 ? named[0].id : nil
+        return matchingWindow(in: candidates, nativeID: nil, frame: rect, title: title,
+                              id: { $0.id }, geometry: { $0.window.frame }, name: { $0.window.title })?.id
     }
 
     func event(_ element: AXUIElement, notification: String) {
@@ -192,17 +184,8 @@ private struct WindowRecord {
                     guard let rect = axRect(element) else { continue }
                     let title: String = ax(element, kAXTitleAttribute) ?? ""
                     let candidates = windows.filter { !used.contains($0.windowID) }
-                    if let id = axWindowID(element), let window = candidates.first(where: { $0.windowID == id }) {
-                        used.insert(id)
-                        next[id] = WindowRecord(id: id, pid: pid, window: window, element: element, minimized: ax(element, kAXMinimizedAttribute) ?? false)
-                        continue
-                    }
-                    let sameFrame = candidates.filter {
-                        abs($0.frame.minX - rect.minX) < 3 && abs($0.frame.minY - rect.minY) < 3 &&
-                        abs($0.frame.width - rect.width) < 3 && abs($0.frame.height - rect.height) < 3
-                    }
-                    let sameTitle = candidates.filter { $0.title == title && !title.isEmpty }
-                    let window = sameFrame.first(where: { $0.title == title }) ?? (sameFrame.count == 1 ? sameFrame[0] : nil) ?? (sameTitle.count == 1 ? sameTitle[0] : nil)
+                    let window = matchingWindow(in: candidates, nativeID: axWindowID(element), frame: rect, title: title,
+                                                id: { $0.windowID }, geometry: { $0.frame }, name: { $0.title })
                     if let window {
                         used.insert(window.windowID)
                         next[window.windowID] = WindowRecord(id: window.windowID, pid: pid, window: window, element: element, minimized: ax(element, kAXMinimizedAttribute) ?? false)
