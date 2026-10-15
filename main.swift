@@ -401,6 +401,10 @@ private struct WindowRecord {
     override var canBecomeKey: Bool { false }
 }
 
+@MainActor private final class SettingsGlassContainer: NSGlassEffectContainerView {
+    override var isFlipped: Bool { true }
+}
+
 @MainActor private final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = WindowStore()
     let updater = AppUpdater(configuration: glassDockUpdateConfiguration)
@@ -454,9 +458,23 @@ private struct WindowRecord {
         NSApp.setActivationPolicy(.accessory)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: "GlassDock")
+        status.button?.toolTip = "GlassDock — предпросмотр окон"
         let menu = NSMenu()
-        for (title, selector) in [("Настройки…", #selector(showSettings)), ("Обновить…", #selector(updateApp)), ("Доступы macOS…", #selector(showPermissions)), ("Показать демо", #selector(showDemo))] {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+        let heading = NSMenuItem(title: "GlassDock  \(version)", action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        menu.addItem(heading)
+        menu.addItem(.separator())
+        for (title, symbol, selector, key) in [
+            ("Настройки…", "slider.horizontal.3", #selector(showSettings), ","),
+            ("Обновить…", "arrow.triangle.2.circlepath", #selector(updateApp), ""),
+            ("", "", #selector(showSettings), ""),
+            ("Показать демо", "rectangle.on.rectangle", #selector(showDemo), ""),
+            ("Доступы macOS…", "lock.shield", #selector(showPermissions), "")
+        ] {
+            if title.isEmpty { menu.addItem(.separator()); continue }
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
             item.target = self
             menu.addItem(item)
         }
@@ -788,90 +806,167 @@ private struct WindowRecord {
         return window
     }
 
+    func settingsRow(_ title: String, value: NSView) -> NSStackView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        row.addArrangedSubview(label(title))
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(value)
+        return row
+    }
+
+    func settingsCard(_ title: String, symbol: String, views: [NSView]) -> NSGlassEffectView {
+        let glass = NSGlassEffectView()
+        glass.style = .regular
+        glass.cornerRadius = 18
+        glass.translatesAutoresizingMaskIntoConstraints = false
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 14
+        content.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        let heading = NSStackView()
+        heading.orientation = .horizontal
+        heading.alignment = .centerY
+        heading.spacing = 8
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)!)
+        icon.contentTintColor = .secondaryLabelColor
+        heading.addArrangedSubview(icon)
+        heading.addArrangedSubview(label(title, size: 14, weight: .semibold))
+        content.addArrangedSubview(heading)
+        for view in views {
+            content.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: content.widthAnchor, constant: -36).isActive = true
+        }
+        glass.contentView = content
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: glass.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: glass.trailingAnchor),
+            content.topAnchor.constraint(equalTo: glass.topAnchor),
+            content.bottomAnchor.constraint(equalTo: glass.bottomAnchor)
+        ])
+        return glass
+    }
+
     @objc func showSettings() {
         if let settingsWindow { settingsWindow.makeKeyAndOrderFront(nil); NSApp.activate(); return }
-        let w = window(title: "GlassDock", width: 420, height: 580)
+        let w = window(title: "GlassDock — настройки", width: 500, height: 660)
         w.styleMask.insert(.resizable)
-        w.contentMinSize = NSSize(width: 380, height: 360)
+        w.titlebarAppearsTransparent = true
+        w.contentMinSize = NSSize(width: 420, height: 380)
+        let background = NSVisualEffectView()
+        background.material = .underWindowBackground
+        background.blendingMode = .behindWindow
+        background.state = .followsWindowActiveState
+        w.contentView = background
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        w.contentView?.addSubview(scroll)
+        background.addSubview(scroll)
         NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: w.contentView!.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: w.contentView!.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: w.contentView!.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor)
+            scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: background.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor)
         ])
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 16
-        stack.edgeInsets = NSEdgeInsets(top: 25, left: 25, bottom: 25, right: 25)
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(label("Предпросмотр окон", size: 20, weight: .semibold))
-        sizeLabel = label("Размер: \(Int(previewWidth)) pt")
-        stack.addArrangedSubview(sizeLabel!)
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 14
+        let icon = NSImageView(image: NSImage(systemSymbolName: "rectangle.stack.fill", accessibilityDescription: "GlassDock")!)
+        icon.contentTintColor = .controlAccentColor
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 32, weight: .medium)
+        icon.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        let titles = NSStackView()
+        titles.orientation = .vertical
+        titles.alignment = .leading
+        titles.spacing = 4
+        titles.addArrangedSubview(label("GlassDock", size: 24, weight: .semibold))
+        let subtitle = label("Окна всегда под рукой", size: 12)
+        subtitle.textColor = .secondaryLabelColor
+        titles.addArrangedSubview(subtitle)
+        header.addArrangedSubview(icon)
+        header.addArrangedSubview(titles)
+        stack.addArrangedSubview(header)
+
+        let sizeValue = label("\(Int(previewWidth)) pt", size: 12)
+        sizeValue.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        sizeValue.textColor = .secondaryLabelColor
+        sizeLabel = sizeValue
         let size = NSSlider(value: previewWidth, minValue: 140, maxValue: 420, target: self, action: #selector(settingsChanged))
         size.isContinuous = true
         size.setAccessibilityLabel("Размер окон предпросмотра")
         sizeSlider = size
-        stack.addArrangedSubview(size)
-        opacityLabel = label("Непрозрачность: \(Int(previewOpacity * 100))%")
-        stack.addArrangedSubview(opacityLabel!)
+        let opacityValue = label("\(Int(previewOpacity * 100))%", size: 12)
+        opacityValue.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        opacityValue.textColor = .secondaryLabelColor
+        opacityLabel = opacityValue
         let opacity = NSSlider(value: previewOpacity, minValue: 0.35, maxValue: 1, target: self, action: #selector(settingsChanged))
         opacity.isContinuous = true
         opacity.setAccessibilityLabel("Непрозрачность окон предпросмотра")
         opacitySlider = opacity
-        stack.addArrangedSubview(opacity)
-        stack.addArrangedSubview(label("Крестик закрытия"))
+        stack.addArrangedSubview(settingsCard("Предпросмотр", symbol: "rectangle.on.rectangle", views: [
+            settingsRow("Размер миниатюр", value: sizeValue), size,
+            settingsRow("Непрозрачность", value: opacityValue), opacity
+        ]))
+
         let closeSide = NSSegmentedControl(labels: ["Слева", "Справа"], trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
         closeSide.selectedSegment = closeButtonSide == "left" ? 0 : 1
         closeSide.setAccessibilityLabel("Угол крестика закрытия")
         closeSideControl = closeSide
-        stack.addArrangedSubview(closeSide)
-        let hint = label("Последнее открытое или свёрнутое окно всегда первым. Содержимое свёрнутых окон появляется после первого открытия; кеш — до 96 окон и 24 МБ только в памяти.")
-        hint.textColor = .secondaryLabelColor
-        stack.addArrangedSubview(hint)
-        let separator = NSBox()
-        separator.boxType = .separator
-        stack.addArrangedSubview(separator)
+        stack.addArrangedSubview(settingsCard("Управление окнами", symbol: "xmark.circle", views: [
+            settingsRow("Кнопка закрытия", value: closeSide)
+        ]))
+
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
-        let updateRow = NSStackView()
-        updateRow.orientation = .horizontal
-        updateRow.alignment = .centerY
-        updateRow.spacing = 16
-        updateRow.addArrangedSubview(label("GlassDock \(version)", size: 14, weight: .semibold))
-        updateRow.addArrangedSubview(NSView())
         let updateButton = NSButton(title: "Обновить", target: self, action: #selector(updateApp))
         updateButton.bezelStyle = .rounded
-        updateRow.addArrangedSubview(updateButton)
+        updateButton.controlSize = .large
         self.updateButton = updateButton
-        stack.addArrangedSubview(updateRow)
         let updateStatus = label(updater.status, size: 12)
         updateStatus.textColor = .secondaryLabelColor
         self.updateStatus = updateStatus
-        stack.addArrangedSubview(updateStatus)
         let progress = NSProgressIndicator()
         progress.style = .bar
         progress.minValue = 0
         progress.maxValue = 1
         self.updateProgress = progress
-        stack.addArrangedSubview(progress)
-        scroll.documentView = stack
+        stack.addArrangedSubview(settingsCard("Обновления", symbol: "arrow.triangle.2.circlepath", views: [
+            settingsRow("Версия \(version)", value: updateButton), updateStatus, progress
+        ]))
+        let hint = label("Последнее активное или свёрнутое окно — первым. Содержимое окон остаётся на этом Mac.", size: 11)
+        hint.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(hint)
+
+        let glassContainer = SettingsGlassContainer()
+        glassContainer.translatesAutoresizingMaskIntoConstraints = false
+        glassContainer.contentView = stack
+        scroll.documentView = glassContainer
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+            glassContainer.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            glassContainer.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            glassContainer.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            glassContainer.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: glassContainer.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: glassContainer.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: glassContainer.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: glassContainer.bottomAnchor)
         ])
-        for view in [size, opacity, separator, updateRow, progress] {
-            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -50).isActive = true
-        }
-        for view in stack.arrangedSubviews where view is NSTextField {
-            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -50).isActive = true
+        for view in stack.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48).isActive = true
         }
         updateObservation = Publishers.CombineLatest3(updater.$status, updater.$busy, updater.$progress)
             .sink { [weak self] status, busy, progress in
@@ -905,8 +1000,8 @@ private struct WindowRecord {
         if let closeSideControl {
             UserDefaults.standard.set(closeSideControl.selectedSegment == 0 ? "left" : "right", forKey: "closeButtonSide")
         }
-        sizeLabel?.stringValue = "Размер: \(Int(previewWidth)) pt"
-        opacityLabel?.stringValue = "Непрозрачность: \(Int(previewOpacity * 100))%"
+        sizeLabel?.stringValue = "\(Int(previewWidth)) pt"
+        opacityLabel?.stringValue = "\(Int(previewOpacity * 100))%"
         if demo { showDemo() }
         else if previewVisible { renderedIDs = []; renderCurrent(force: true) }
     }
