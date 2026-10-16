@@ -2,7 +2,7 @@ import Foundation
 
 func matchingWindow<Value>(in candidates: [Value], nativeID: UInt32?, frame: CGRect?, title: String,
                            id: (Value) -> UInt32, geometry: (Value) -> CGRect, name: (Value) -> String?) -> Value? {
-    if let nativeID, let exact = candidates.first(where: { id($0) == nativeID }) { return exact }
+    if let nativeID { return candidates.first(where: { id($0) == nativeID }) }
     if let frame {
         let geometric = candidates.filter {
             let candidate = geometry($0)
@@ -53,6 +53,80 @@ func previewGroupContains(_ point: CGPoint, frames: [CGRect]) -> Bool {
         }
     }
     return false
+}
+
+func normalizedEnlargedPreviewAmount(_ value: Double) -> CGFloat {
+    value.isFinite ? CGFloat(max(0, min(1, value))) : 0.1
+}
+
+func previewScreenIndex(thumbnail: CGRect, displays: [CGRect]) -> Int? {
+    let center = CGPoint(x: thumbnail.midX, y: thumbnail.midY)
+    if let index = displays.firstIndex(where: { $0.contains(center) }) { return index }
+    return displays.indices.max { left, right in
+        let a = displays[left].intersection(thumbnail), b = displays[right].intersection(thumbnail)
+        return (a.isNull ? 0 : a.width * a.height) < (b.isNull ? 0 : b.width * b.height)
+    }
+}
+
+func enlargedPreviewFrame(display: CGRect, visible: CGRect, thumbnail: CGRect, amount: CGFloat) -> CGRect {
+    let fraction = normalizedEnlargedPreviewAmount(Double(amount))
+    if fraction == 0 { return thumbnail }
+    if fraction == 1 { return display }
+    let target = visible.insetBy(dx: 8, dy: 8)
+    let width = min(target.width, thumbnail.width + (target.width - thumbnail.width) * fraction)
+    let height = min(target.height, thumbnail.height + (target.height - thumbnail.height) * fraction)
+    return CGRect(x: max(target.minX, min(thumbnail.midX - width / 2, target.maxX - width)),
+                  y: max(target.minY, min(thumbnail.midY - height / 2, target.maxY - height)), width: width, height: height)
+}
+
+func enlargedPreviewContains(_ point: CGPoint, thumbnails: [CGRect], enlarged: CGRect) -> Bool {
+    if enlarged.contains(point) || previewGroupContains(point, frames: thumbnails) { return true }
+    return thumbnails.contains { frame in
+        let horizontalGap = max(frame.minX, enlarged.minX) - min(frame.maxX, enlarged.maxX)
+        let verticalGap = max(frame.minY, enlarged.minY) - min(frame.maxY, enlarged.maxY)
+        guard (horizontalGap >= 0 && horizontalGap <= 6.01) || (verticalGap >= 0 && verticalGap <= 6.01) else { return false }
+        return isPreviewBridge(point, icon: frame, preview: enlarged) || isPreviewBridge(point, icon: enlarged, preview: frame)
+    }
+}
+
+func thumbnailControlFrames(in bounds: CGRect, closeSide: String, magnifierSide: String = "left") -> (magnifier: CGRect, close: CGRect) {
+    let close = previewCloseButtonFrame(in: bounds, side: closeSide)
+    var magnifier = previewCloseButtonFrame(in: bounds, side: magnifierSide)
+    if magnifier.intersects(close) {
+        magnifier.origin.x = magnifierSide == "right" ? close.minX - 4 - magnifier.width : close.maxX + 4
+    }
+    if !bounds.contains(magnifier) || magnifier.intersects(close) {
+        magnifier = CGRect(x: bounds.midX, y: bounds.midY, width: 0, height: 0)
+    }
+    return (magnifier, close)
+}
+
+/// One native capture at a time; a changed/hidden selection invalidates its result.
+struct EnlargedPreviewSession {
+    private(set) var windowID: UInt32?
+    private(set) var generation: UInt64 = 0
+    private(set) var capturePending = false
+    private(set) var nextCaptureAt: TimeInterval = 0
+    private var failures = 0
+    mutating func show(_ id: UInt32) { generation &+= 1; windowID = id; nextCaptureAt = 0; failures = 0 }
+    mutating func hide() { generation &+= 1; windowID = nil; nextCaptureAt = 0; failures = 0 }
+    mutating func beginCapture(now: TimeInterval = Date.timeIntervalSinceReferenceDate) -> (id: UInt32, generation: UInt64)? {
+        guard let windowID, !capturePending, now >= nextCaptureAt else { return nil }
+        capturePending = true
+        return (windowID, generation)
+    }
+    mutating func finishCapture(id: UInt32, generation: UInt64, success: Bool = true,
+                                now: TimeInterval = Date.timeIntervalSinceReferenceDate, interval: TimeInterval = 2) -> Bool {
+        capturePending = false
+        guard windowID == id && self.generation == generation else { return false }
+        failures = success ? 0 : min(failures + 1, 4)
+        nextCaptureAt = now + min(30, interval * pow(2, Double(failures)))
+        return true
+    }
+}
+
+func enlargedPreviewRefreshInterval(lowPower: Bool, thermalSerious: Bool) -> TimeInterval {
+    lowPower || thermalSerious ? 4 : 2
 }
 
 func isDockPreviewTrigger(_ point: CGPoint, icon: CGRect) -> Bool {
@@ -220,6 +294,8 @@ func runSelfTests() {
     precondition(matched(duplicates) == nil, "Ambiguous title and frame must not select another window")
     precondition(matched(duplicates, nativeID: 2) == 2)
     precondition(matched(duplicates, nativeID: 99) == nil)
+    precondition(matched([duplicates[0]], nativeID: 99) == nil, "A known absent ID must never fall back to a lookalike")
+    precondition(matched([duplicates[0]], nativeID: 2) == nil, "An ID outside the PID-filtered candidates must not bind another window")
     precondition(matched([duplicates[0]]) == 1)
     precondition(matched([duplicates[0]], title: "Changed title") == 1)
     precondition(matched([duplicates[0]], frame: nil) == 1)
@@ -340,5 +416,73 @@ func runSelfTests() {
     precondition(!probe.retry(targetExists: true, at: 1.6))
     probe.reset()
     precondition(probe.retry(targetExists: false, at: 2))
-    print("PASS: 74 checks — unambiguous window matching, preview/MRU/close regressions, byte-bound priority cache, capture throttle, bounded idle Dock probes and focused-only refresh lifecycle")
+    for closeSide in ["left", "right"] {
+        for magnifierSide in ["left", "right"] {
+            let controls = thumbnailControlFrames(in: card, closeSide: closeSide, magnifierSide: magnifierSide)
+            precondition(controls.close == previewCloseButtonFrame(in: card, side: closeSide), "X remains at its configured outer edge")
+            precondition(card.contains(controls.close) && card.contains(controls.magnifier))
+            precondition(!controls.close.intersects(controls.magnifier), "Buttons must never overlap")
+            precondition(magnifierSide == "left" ? controls.magnifier.midX < card.midX : controls.magnifier.midX > card.midX)
+        }
+    }
+    let tinyControls = thumbnailControlFrames(in: tinyCard, closeSide: "left", magnifierSide: "left")
+    precondition(tinyControls.close == previewCloseButtonFrame(in: tinyCard, side: "left") && tinyControls.magnifier.isEmpty)
+    precondition(normalizedEnlargedPreviewAmount(.nan) == 0.1 && normalizedEnlargedPreviewAmount(.infinity) == 0.1)
+    precondition(normalizedEnlargedPreviewAmount(-1) == 0 && normalizedEnlargedPreviewAmount(2) == 1)
+    let displays = [CGRect(x: 0, y: 0, width: 1470, height: 956), CGRect(x: -1055, y: 956, width: 3440, height: 1440)]
+    let externalMini = CGRect(x: -800, y: 980, width: 234, height: 150)
+    precondition(previewScreenIndex(thumbnail: externalMini, displays: displays) == 1)
+    for display in displays {
+        let visible = display.insetBy(dx: 0, dy: 30)
+        let row = separatePreviewFrames(count: 8, width: 230, visible: visible.insetBy(dx: 8, dy: 8), anchor: CGRect(x: visible.minX, y: visible.maxY - 100, width: 50, height: 50), orientation: "left")
+        for mini in row {
+            precondition(enlargedPreviewFrame(display: display, visible: visible, thumbnail: mini, amount: 0) == mini)
+            precondition(enlargedPreviewFrame(display: display, visible: visible, thumbnail: mini, amount: 1) == display)
+            for fraction: CGFloat in [0.01, 0.1, 0.5, 0.99] {
+                let large = enlargedPreviewFrame(display: display, visible: visible, thumbnail: mini, amount: fraction)
+                precondition(visible.insetBy(dx: 8, dy: 8).contains(large))
+                precondition(large.intersects(mini), "Every size must connect to the clicked miniature, including ragged rows")
+                precondition(enlargedPreviewContains(CGPoint(x: mini.midX, y: mini.midY), thumbnails: row, enlarged: large))
+                precondition(!enlargedPreviewContains(CGPoint(x: display.maxX + 10, y: display.maxY + 10), thumbnails: row, enlarged: large))
+            }
+        }
+    }
+    let isolatedMinis = [CGRect(x: 0, y: 0, width: 100, height: 100), CGRect(x: 106, y: 0, width: 100, height: 100)]
+    precondition(!enlargedPreviewContains(CGPoint(x: 180, y: 150), thumbnails: isolatedMinis, enlarged: CGRect(x: 0, y: 100, width: 100, height: 100)), "Empty bounding-box space must dismiss immediately")
+    var enlarged = EnlargedPreviewSession()
+    precondition(enlarged.beginCapture() == nil, "Hidden previews cannot start a capture")
+    enlarged.show(1)
+    let firstLargeCapture = enlarged.beginCapture()!
+    precondition(enlarged.beginCapture() == nil, "Only one large capture may be in flight")
+    enlarged.show(2)
+    precondition(enlarged.beginCapture() == nil, "Repeated clicks coalesce behind the current capture")
+    precondition(!enlarged.finishCapture(id: firstLargeCapture.id, generation: firstLargeCapture.generation))
+    let nextLargeCapture = enlarged.beginCapture()!
+    precondition(nextLargeCapture.id == 2)
+    enlarged.hide()
+    precondition(!enlarged.finishCapture(id: nextLargeCapture.id, generation: nextLargeCapture.generation), "Capture completion must not reopen a hidden panel")
+    precondition(enlarged.beginCapture() == nil)
+    enlarged.show(3)
+    let finalLargeCapture = enlarged.beginCapture()!
+    precondition(enlarged.finishCapture(id: finalLargeCapture.id, generation: finalLargeCapture.generation))
+    var refresh = EnlargedPreviewSession()
+    refresh.show(4)
+    let initial = refresh.beginCapture(now: 10)!
+    precondition(refresh.finishCapture(id: initial.id, generation: initial.generation, now: 10))
+    precondition(refresh.beginCapture(now: 11.99) == nil)
+    let failed = refresh.beginCapture(now: 12)!
+    precondition(refresh.finishCapture(id: failed.id, generation: failed.generation, success: false, now: 12))
+    precondition(refresh.nextCaptureAt == 16 && refresh.beginCapture(now: 15.99) == nil)
+    let secondFailure = refresh.beginCapture(now: 16)!
+    precondition(refresh.finishCapture(id: secondFailure.id, generation: secondFailure.generation, success: false, now: 16))
+    precondition(refresh.nextCaptureAt == 24)
+    let recovered = refresh.beginCapture(now: 24)!
+    precondition(refresh.finishCapture(id: recovered.id, generation: recovered.generation, now: 24, interval: 4))
+    precondition(refresh.nextCaptureAt == 28)
+    precondition(enlargedPreviewRefreshInterval(lowPower: false, thermalSerious: false) == 2)
+    precondition(enlargedPreviewRefreshInterval(lowPower: true, thermalSerious: false) == 4)
+    precondition(enlargedPreviewRefreshInterval(lowPower: false, thermalSerious: true) == 4)
+    refresh.hide()
+    precondition(refresh.beginCapture(now: 1000) == nil)
+    print("PASS: 74 existing checks + native-ID safety, magnifier geometry, refresh cadence/backoff and stale-capture lifecycle regressions")
 }

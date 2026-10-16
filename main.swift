@@ -51,6 +51,7 @@ private struct WindowRecord {
     var observedWindows: [pid_t: [AXUIElement]] = [:]
     var refreshing = false
     var captureBusy = false
+    var thumbnailCapturesPaused = false
     var onChange: (() -> Void)?
     var thumbnailWidth: CGFloat = 230
     var lastInventory = Date.distantPast
@@ -86,7 +87,7 @@ private struct WindowRecord {
     }
 
     func match(_ element: AXUIElement, pid: pid_t) -> CGWindowID? {
-        if let id = axWindowID(element), records[id]?.pid == pid { return id }
+        if let id = axWindowID(element) { return records[id]?.pid == pid ? id : nil }
         let title: String = ax(element, kAXTitleAttribute) ?? ""
         let rect = axRect(element)
         let candidates = records.values.filter { $0.pid == pid }
@@ -254,14 +255,14 @@ private struct WindowRecord {
     }
 
     func capture(_ ids: [CGWindowID], width: CGFloat) async {
-        guard !suspended else { return }
+        guard !suspended, !thumbnailCapturesPaused else { return }
         guard CGPreflightScreenCaptureAccess(), AXIsProcessTrusted() else { clearPrivateCache(); return }
         for id in ids { captureQueue[id] = max(captureQueue[id] ?? 0, width) }
         guard !captureBusy else { return }
         captureBusy = true
         defer { captureBusy = false; onChange?() }
         while let id = order.sorted(Array(captureQueue.keys)).first {
-            guard !suspended else { break }
+            guard !suspended, !thumbnailCapturesPaused else { break }
             let width = captureQueue.removeValue(forKey: id)!
             guard let record = records[id], !record.minimized else { continue }
             guard captureThrottle.allow(id, at: Date.timeIntervalSinceReferenceDate, interval: 0.7) else { continue }
@@ -281,6 +282,21 @@ private struct WindowRecord {
                 images.insert(NSImage(cgImage: image, size: .zero), for: id, bytes: image.bytesPerRow * image.height, priority: order.recency[id, default: 0])
             } catch { /* Retain the last good thumbnail during transient/minimize races. */ }
         }
+    }
+
+    func enlargedImage(_ id: CGWindowID, size: CGSize, scale: CGFloat) async -> NSImage? {
+        guard !suspended, CGPreflightScreenCaptureAccess(), AXIsProcessTrusted(), let record = records[id], !record.minimized else { return nil }
+        let factor = min(max(1, scale), 1920 / max(1, size.width), 1200 / max(1, size.height))
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(size.width * factor))
+        configuration.height = max(1, Int(size.height * factor))
+        configuration.backgroundColor = screenshotBackground
+        configuration.showsCursor = false; configuration.scalesToFit = true; configuration.ignoreShadowsSingleWindow = true
+        captureCount += 1
+        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: record.window), configuration: configuration),
+              !suspended, let current = records[id], current.pid == record.pid, !current.minimized,
+              CGPreflightScreenCaptureAccess(), AXIsProcessTrusted() else { return nil }
+        return NSImage(cgImage: image, size: .zero)
     }
 
     func windows(for pid: pid_t) -> [WindowRecord] {
@@ -317,12 +333,15 @@ private struct WindowRecord {
     var image: NSImage?
     var action: (() -> Void)?
     var closeAction: (() -> Void)?
+    var enlargeAction: (() -> Void)?
     var closeButtonSide = "right" { didSet { needsLayout = true } }
+    var magnifierButtonSide = "left" { didSet { needsLayout = true } }
     var minimized = false {
         didSet { minimizedMarker.isHidden = !minimized; needsDisplay = true }
     }
     let minimizedMarker = PassthroughImageView()
     let closeButton = NSButton()
+    let enlargeButton = NSButton()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -343,14 +362,26 @@ private struct WindowRecord {
         closeButton.action = #selector(closeClicked)
         closeButton.setAccessibilityLabel("Закрыть это окно")
         addSubview(closeButton)
+        enlargeButton.image = NSImage(systemSymbolName: "plus.magnifyingglass", accessibilityDescription: "Увеличить предпросмотр")?.withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
+        enlargeButton.isBordered = false; enlargeButton.imagePosition = .imageOnly
+        enlargeButton.contentTintColor = .white.withAlphaComponent(0.85)
+        enlargeButton.wantsLayer = true; enlargeButton.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.30).cgColor
+        enlargeButton.layer?.cornerRadius = 10
+        enlargeButton.target = self; enlargeButton.action = #selector(enlargeClicked)
+        enlargeButton.setAccessibilityLabel("Увеличить предпросмотр")
+        enlargeButton.toolTip = "Увеличить предпросмотр этого окна"
+        addSubview(enlargeButton)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func layout() {
         super.layout()
         minimizedMarker.frame = CGRect(x: bounds.midX - 16, y: bounds.midY - 16, width: 32, height: 32)
-        closeButton.frame = previewCloseButtonFrame(in: bounds, side: closeButtonSide)
+        let controls = thumbnailControlFrames(in: bounds, closeSide: closeButtonSide, magnifierSide: magnifierButtonSide)
+        closeButton.frame = controls.close; enlargeButton.frame = controls.magnifier
+        enlargeButton.isHidden = controls.magnifier.isEmpty
     }
     @objc func closeClicked() { closeAction?() }
+    @objc func enlargeClicked() { enlargeAction?() }
     override func draw(_ dirtyRect: NSRect) {
         guard let image else { return }
         let inset = bounds.insetBy(dx: 1, dy: 1)
@@ -384,6 +415,70 @@ private struct WindowRecord {
     override var canBecomeKey: Bool { false }
 }
 
+// A wrapper prevents NSGlassEffectView from adopting the image's intrinsic pixel size.
+@MainActor private final class BoundedPreviewImageView: NSImageView {
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric) }
+}
+
+@MainActor private final class EnlargedPreviewContent: NSGlassEffectView {
+    let wrapper = NSView()
+    let imageView = BoundedPreviewImageView()
+    init(size: CGSize, image: NSImage) {
+        super.init(frame: CGRect(origin: .zero, size: size))
+        style = .clear; cornerRadius = 14
+        wrapper.frame = bounds; wrapper.autoresizingMask = [.width, .height]
+        imageView.frame = wrapper.bounds.insetBy(dx: 6, dy: 6)
+        imageView.autoresizingMask = [.width, .height]
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.image = image
+        wrapper.addSubview(imageView); contentView = wrapper
+        wantsLayer = true; layer?.masksToBounds = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func layout() {
+        super.layout()
+        wrapper.frame = bounds; imageView.frame = wrapper.bounds.insetBy(dx: 6, dy: 6)
+    }
+}
+
+@MainActor private func runNativePreviewSelfTests() {
+    _ = NSApplication.shared
+    let panel = PreviewPanel()
+    let desired = CGRect(x: -1000, y: 1200, width: 480, height: 300)
+    let content = EnlargedPreviewContent(size: desired.size, image: NSImage(size: NSSize(width: 6000, height: 4000)))
+    panel.contentView = content; panel.setFrame(desired, display: false)
+    content.layoutSubtreeIfNeeded()
+    precondition(panel.frame == desired && content.frame.size == desired.size)
+    precondition(content.imageView.frame == content.bounds.insetBy(dx: 6, dy: 6))
+    content.imageView.image = NSImage(size: NSSize(width: 10000, height: 7000))
+    content.needsLayout = true; content.layoutSubtreeIfNeeded()
+    precondition(panel.frame == desired && content.frame.size == desired.size)
+    panel.setFrame(CGRect(x: -1000, y: 1200, width: 700, height: 450), display: false)
+    content.needsLayout = true; content.layoutSubtreeIfNeeded()
+    precondition(content.frame.size == CGSize(width: 700, height: 450))
+    precondition(content.imageView.frame == content.bounds.insetBy(dx: 6, dy: 6))
+    precondition(content.imageView.imageScaling == .scaleProportionallyUpOrDown)
+    panel.contentView = nil
+    // Refreshing a live enlargement must update owned, hidden thumbnails without ordering them in.
+    let delegate = AppDelegate()
+    let image = NSImage(size: NSSize(width: 720, height: 460))
+    let anchor = CGRect(x: NSScreen.screens[0].visibleFrame.midX, y: NSScreen.screens[0].visibleFrame.minY, width: 50, height: 50)
+    delegate.enlargedSession.show(101)
+    delegate.buildPreview(images: [image], ids: [101], minimized: [false], anchor: anchor)
+    delegate.renderedIDs = [101]
+    let hiddenContent = delegate.panels[0].contentView
+    delegate.buildPreview(images: [image], ids: [101], minimized: [false], anchor: anchor)
+    precondition(delegate.panels.allSatisfy { !$0.isVisible } && delegate.previewFrames.isEmpty)
+    precondition(delegate.panels[0].contentView === hiddenContent, "Hidden cache paints must reuse thumbnail content")
+    precondition(delegate.enlargedSession.windowID == 101, "Positioning must accept owned hidden thumbnail frames")
+    delegate.hoveredPID = getpid()
+    delegate.buildPreview(images: [image], ids: [102], minimized: [false], anchor: anchor)
+    precondition(delegate.enlargedSession.windowID == nil && delegate.hoveredPID == nil && !delegate.previewVisible)
+    precondition(delegate.panels.allSatisfy { $0.contentView == nil }, "Full dismissal must release thumbnail view/image ownership")
+    precondition(delegate.thumbnailIDs.isEmpty && !delegate.store.thumbnailCapturesPaused)
+    print("PASS: native bounded image layout, huge replacement, panel resize, hidden cache refresh and removed selected window")
+}
+
 @MainActor private final class SettingsGlassContainer: NSGlassEffectContainerView {
     override var isFlipped: Bool { true }
 }
@@ -396,7 +491,12 @@ private struct WindowRecord {
     var updateStatus: NSTextField?
     var updateProgress: NSProgressIndicator?
     var panels: [PreviewPanel] = []
-    var previewVisible: Bool { panels.contains { $0.isVisible } }
+    let enlargedPanel = PreviewPanel()
+    var enlargedSession = EnlargedPreviewSession()
+    var thumbnailIDs: [CGWindowID] = []
+    var enlargedEscapeMonitor: Any?
+    var enlargedLocalEscapeMonitor: Any?
+    var previewVisible: Bool { enlargedPanel.isVisible || panels.contains { $0.isVisible } }
     var previewFrames: [CGRect] { panels.filter { $0.isVisible }.map(\.frame) }
     var status: NSStatusItem!
     var settingsWindow: NSWindow?
@@ -406,6 +506,9 @@ private struct WindowRecord {
     var sizeLabel: NSTextField?
     var opacityLabel: NSTextField?
     var closeSideControl: NSSegmentedControl?
+    var magnifierSideControl: NSSegmentedControl?
+    var enlargedSizeSlider: NSSlider?
+    var enlargedSizeLabel: NSTextField?
     var timer: Timer?
     var cacheTimer: Timer?
     var focusedCaptureTimer: Timer?
@@ -435,9 +538,11 @@ private struct WindowRecord {
     var previewWidth: CGFloat { max(140, min(420, CGFloat(UserDefaults.standard.double(forKey: "previewWidth")))) }
     var previewOpacity: CGFloat { max(0.35, min(1, CGFloat(UserDefaults.standard.double(forKey: "previewOpacity")))) }
     var closeButtonSide: String { UserDefaults.standard.string(forKey: "closeButtonSide") == "left" ? "left" : "right" }
+    var magnifierButtonSide: String { UserDefaults.standard.string(forKey: "magnifierButtonSide") == "right" ? "right" : "left" }
+    var enlargedPreviewAmount: CGFloat { normalizedEnlargedPreviewAmount(UserDefaults.standard.double(forKey: "enlargedPreviewAmount")) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        UserDefaults.standard.register(defaults: ["previewWidth": 230.0, "previewOpacity": 0.94, "closeButtonSide": "right"])
+        UserDefaults.standard.register(defaults: ["previewWidth": 230.0, "previewOpacity": 0.94, "closeButtonSide": "right", "magnifierButtonSide": "left", "enlargedPreviewAmount": 0.1])
         NSApp.setActivationPolicy(.accessory)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: "GlassDock")
@@ -474,6 +579,7 @@ private struct WindowRecord {
         store.onChange = { [weak self] in
             guard let self, self.previewVisible, !self.demo else { return }
             // Inventory/capture completion only paints; it must never enqueue another capture cycle.
+            if self.enlargedSession.windowID != nil { _ = self.validateEnlargedSelection(); return }
             if let pid = self.hoveredPID { self.presentCached(pid: pid) }
         }
         store.thumbnailWidth = previewWidth
@@ -542,6 +648,10 @@ private struct WindowRecord {
     func pointerChanged() {
         guard !sleeping else { return }
         let point = NSEvent.mouseLocation
+        if enlargedSession.windowID != nil, enlargedPanel.isVisible,
+           !enlargedPanel.frame.contains(point) {
+            hidePreview()
+        } else if previewVisible { poll() }
         if point != cachedDockPoint { dockProbeBudget.reset() }
         let nearAnyEdge = NSScreen.screens.contains { screen in
             ["bottom", "left", "right"].contains { nearDockEdge(point, screen: screen.frame, orientation: $0) }
@@ -598,6 +708,10 @@ private struct WindowRecord {
     func poll() {
         pointerPollCount += 1
         let point = NSEvent.mouseLocation
+        if enlargedSession.windowID != nil, enlargedPanel.isVisible {
+            guard enlargedPanel.frame.contains(point) else { hidePreview(); return }
+            captureEnlargedPreview(); return
+        }
         if demo {
             if Date() > demoExpires && !previewGroupContains(point, frames: previewFrames) { hidePreview() }
             return
@@ -640,7 +754,9 @@ private struct WindowRecord {
 
     func hidePreview() {
         generation += 1
-        panels.forEach { $0.orderOut(nil) }
+        panels.forEach { $0.orderOut(nil); $0.contentView = nil }
+        hideEnlargedPreview()
+        thumbnailIDs = []
         hoveredPID = nil
         renderedIDs = []
         demo = false
@@ -649,7 +765,7 @@ private struct WindowRecord {
     }
 
     func renderCurrent(force: Bool = false) {
-        guard let pid = hoveredPID, !demo else { return }
+        guard let pid = hoveredPID, !demo, enlargedSession.windowID == nil else { return }
         // Changing icons must show an existing cache even if the previous icon's capture is still pending.
         if !previewVisible || force { presentCached(pid: pid) }
         guard !rendering, force || Date().timeIntervalSince(lastRender) >= 0.7 else { return }
@@ -660,6 +776,7 @@ private struct WindowRecord {
         presentCached(pid: pid)
         Task {
             await store.refresh()
+            guard generation == token, hoveredPID == pid, enlargedSession.windowID == nil else { rendering = false; return }
             let windows = store.windows(for: pid)
             let screen = NSScreen.screens.first(where: { $0.frame.intersects(dockRect) }) ?? NSScreen.main
             let actualWidth = screen.map {
@@ -667,36 +784,46 @@ private struct WindowRecord {
             } ?? previewWidth
             await store.capture(windows.map(\.id), width: max(1, actualWidth - 4))
             defer { rendering = false }
-            guard generation == token, hoveredPID == pid else { return }
+            guard generation == token, hoveredPID == pid, enlargedSession.windowID == nil else { return }
             presentCached(pid: pid)
         }
     }
 
     func presentCached(pid: pid_t) {
+        if enlargedSession.windowID != nil { _ = validateEnlargedSelection(); return }
         let available = store.windows(for: pid).filter { store.images[$0.id] != nil }
-        guard !available.isEmpty else { panels.forEach { $0.orderOut(nil) }; return }
+        guard !available.isEmpty else {
+            if enlargedSession.windowID != nil { hidePreview() }
+            else { panels.forEach { $0.orderOut(nil) } }
+            return
+        }
         let ids = available.map(\.id)
+        if let selected = enlargedSession.windowID, !ids.contains(selected) { hidePreview(); return }
         buildPreview(images: available.compactMap { store.images[$0.id] }, ids: ids, minimized: available.map(\.minimized), anchor: dockRect)
         renderedIDs = ids
     }
 
     func buildPreview(images: [NSImage], ids: [CGWindowID], minimized: [Bool], anchor: CGRect) {
         guard images.count == ids.count, minimized.count == images.count else { return }
+        if let selected = enlargedSession.windowID, !ids.contains(selected) { hidePreview(); return }
         guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(anchor) }) ?? NSScreen.main else { return }
         let orientation = demo ? "bottom" : (CFPreferencesCopyAppValue("orientation" as CFString, "com.apple.dock" as CFString) as? String ?? "bottom")
         let frames = separatePreviewFrames(count: images.count, width: previewWidth, visible: screen.visibleFrame.insetBy(dx: 8, dy: 8), anchor: anchor, orientation: orientation)
+        thumbnailIDs = ids
         while panels.count > images.count { panels.removeLast().orderOut(nil) }
         while panels.count < images.count { panels.append(PreviewPanel()) }
         for (index, image) in images.enumerated() {
             let panel = panels[index]
             let frame = frames[index]
-            if renderedIDs == ids && panel.isVisible && !demo,
-               panel.frame.size == frame.size,
+            if renderedIDs == ids && !demo,
+               (panel.isVisible && panel.frame.size == frame.size) || enlargedSession.windowID != nil,
                let glass = panel.contentView as? NSGlassEffectView,
                let view = glass.contentView as? ThumbnailView {
+                view.frame = CGRect(origin: .zero, size: frame.size).insetBy(dx: 2, dy: 2)
                 view.image = image
                 view.minimized = minimized[index]
                 view.closeButtonSide = closeButtonSide
+                view.magnifierButtonSide = magnifierButtonSide
                 view.needsDisplay = true
             } else {
                 let glass = NSGlassEffectView(frame: CGRect(origin: .zero, size: frame.size))
@@ -706,6 +833,7 @@ private struct WindowRecord {
                 view.image = image
                 view.minimized = minimized[index]
                 view.closeButtonSide = closeButtonSide
+                view.magnifierButtonSide = magnifierButtonSide
                 view.setAccessibilityElement(true)
                 view.setAccessibilityRole(.button)
                 view.setAccessibilityLabel("Открыть окно \(index + 1)")
@@ -715,6 +843,7 @@ private struct WindowRecord {
                     self.hidePreview()
                 }
                 let id = ids[index]
+                view.enlargeAction = { [weak self] in self?.showEnlargedPreview(id) }
                 view.closeAction = { [weak self] in
                     guard let self else { return }
                     if self.demo {
@@ -733,7 +862,86 @@ private struct WindowRecord {
             panel.setAccessibilityLabel("GlassDock — предпросмотр \(index + 1)")
             panel.alphaValue = previewOpacity
             panel.setFrame(frame, display: true)
-            panel.orderFrontRegardless()
+            if enlargedSession.windowID != nil { panel.orderOut(nil) }
+            else { panel.orderFrontRegardless() }
+        }
+        if let id = enlargedSession.windowID {
+            positionEnlargedPreview(id)
+        }
+    }
+
+    @discardableResult func validateEnlargedSelection() -> Bool {
+        guard let id = enlargedSession.windowID else { return false }
+        if !demo, store.records[id] == nil { hidePreview(); return false }
+        return true
+    }
+
+    func hideEnlargedPreview() {
+        enlargedSession.hide()
+        store.thumbnailCapturesPaused = false
+        if let enlargedEscapeMonitor { NSEvent.removeMonitor(enlargedEscapeMonitor) }
+        if let enlargedLocalEscapeMonitor { NSEvent.removeMonitor(enlargedLocalEscapeMonitor) }
+        enlargedEscapeMonitor = nil; enlargedLocalEscapeMonitor = nil
+        enlargedPanel.orderOut(nil); enlargedPanel.contentView = nil
+    }
+    func positionEnlargedPreview(_ id: CGWindowID) {
+        guard let index = thumbnailIDs.firstIndex(of: id), index < panels.count,
+              let screenIndex = previewScreenIndex(thumbnail: panels[index].frame, displays: NSScreen.screens.map(\.frame)) else { hidePreview(); return }
+        let screen = NSScreen.screens[screenIndex]
+        let frame = enlargedPreviewFrame(display: screen.frame, visible: screen.visibleFrame, thumbnail: panels[index].frame, amount: enlargedPreviewAmount)
+        enlargedPanel.setFrame(frame, display: true)
+        enlargedPanel.contentView?.needsLayout = true
+        enlargedPanel.contentView?.layoutSubtreeIfNeeded()
+    }
+    func showEnlargedPreview(_ id: CGWindowID) {
+        let image = demo ? demoItems.first(where: { $0.id == id })?.content : store.images[id]
+        guard let image else { return }
+        enlargedSession.show(id)
+        store.thumbnailCapturesPaused = true
+        store.captureQueue.removeAll()
+        positionEnlargedPreview(id)
+        guard enlargedSession.windowID == id else { return }
+        enlargedPanel.contentView = EnlargedPreviewContent(size: enlargedPanel.frame.size, image: image)
+        // Reapply the bounded outer frame after installing the native glass content.
+        positionEnlargedPreview(id)
+        enlargedPanel.title = "GlassDock — увеличенный предпросмотр"
+        enlargedPanel.setAccessibilityLabel("GlassDock — увеличенный предпросмотр")
+        enlargedPanel.alphaValue = previewOpacity
+        panels.forEach { $0.orderOut(nil) }
+        enlargedPanel.orderFrontRegardless()
+        if enlargedEscapeMonitor == nil {
+            enlargedEscapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                if event.keyCode == 53 { MainActor.assumeIsolated { self?.hidePreview() } }
+            }
+            enlargedLocalEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                if event.keyCode == 53 { MainActor.assumeIsolated { self?.hidePreview() }; return nil }
+                return event
+            }
+        }
+        captureEnlargedPreview()
+    }
+    func captureEnlargedPreview() {
+        guard !demo, enlargedPanel.isVisible, let request = enlargedSession.beginCapture() else { return }
+        let size = enlargedPanel.frame.size
+        let scale = enlargedPanel.screen?.backingScaleFactor ?? 2
+        Task { [weak self] in
+            guard let self else { return }
+            await self.store.refresh()
+            let image: NSImage?
+            if self.enlargedSession.windowID == request.id, self.enlargedSession.generation == request.generation,
+               self.enlargedPanel.isVisible, self.validateEnlargedSelection() {
+                image = await self.store.enlargedImage(request.id, size: size, scale: scale)
+            } else { image = nil }
+            let process = ProcessInfo.processInfo
+            let interval = enlargedPreviewRefreshInterval(lowPower: process.isLowPowerModeEnabled,
+                thermalSerious: process.thermalState == .serious || process.thermalState == .critical)
+            let current = self.enlargedSession.finishCapture(id: request.id, generation: request.generation,
+                success: image != nil, interval: interval)
+            if current, self.enlargedPanel.isVisible, let image,
+               let content = self.enlargedPanel.contentView as? EnlargedPreviewContent {
+                content.imageView.image = image; content.needsLayout = true; content.layoutSubtreeIfNeeded()
+            }
+            if !current, self.enlargedSession.windowID != nil, self.enlargedPanel.isVisible { self.captureEnlargedPreview() }
         }
     }
 
@@ -901,8 +1109,15 @@ private struct WindowRecord {
         opacity.isContinuous = true
         opacity.setAccessibilityLabel("Непрозрачность окон предпросмотра")
         opacitySlider = opacity
+        let enlargedValue = label("\(Int(enlargedPreviewAmount * 100))%", size: 12)
+        enlargedValue.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        enlargedValue.textColor = .secondaryLabelColor; enlargedSizeLabel = enlargedValue
+        let enlargedSize = NSSlider(value: enlargedPreviewAmount * 100, minValue: 0, maxValue: 100, target: self, action: #selector(settingsChanged))
+        enlargedSize.isContinuous = true; enlargedSize.setAccessibilityLabel("Размер увеличенного превью"); enlargedSizeSlider = enlargedSize
         stack.addArrangedSubview(settingsCard("Предпросмотр", symbol: "rectangle.on.rectangle", views: [
             settingsRow("Размер миниатюр", value: sizeValue), size,
+            settingsRow("Размер увеличенного превью", value: enlargedValue), enlargedSize,
+            label("0% — как миниатюра · 100% — во весь экран · Esc — закрыть", size: 11),
             settingsRow("Непрозрачность", value: opacityValue), opacity
         ]))
 
@@ -910,8 +1125,12 @@ private struct WindowRecord {
         closeSide.selectedSegment = closeButtonSide == "left" ? 0 : 1
         closeSide.setAccessibilityLabel("Угол крестика закрытия")
         closeSideControl = closeSide
+        let magnifierSide = NSSegmentedControl(labels: ["Слева", "Справа"], trackingMode: .selectOne, target: self, action: #selector(settingsChanged))
+        magnifierSide.selectedSegment = magnifierButtonSide == "left" ? 0 : 1
+        magnifierSide.setAccessibilityLabel("Сторона лупы"); magnifierSideControl = magnifierSide
         stack.addArrangedSubview(settingsCard("Управление окнами", symbol: "xmark.circle", views: [
-            settingsRow("Кнопка закрытия", value: closeSide)
+            settingsRow("Кнопка закрытия", value: closeSide),
+            settingsRow("Сторона лупы", value: magnifierSide)
         ]))
 
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
@@ -983,6 +1202,9 @@ private struct WindowRecord {
         if let closeSideControl {
             UserDefaults.standard.set(closeSideControl.selectedSegment == 0 ? "left" : "right", forKey: "closeButtonSide")
         }
+        if let magnifierSideControl { UserDefaults.standard.set(magnifierSideControl.selectedSegment == 0 ? "left" : "right", forKey: "magnifierButtonSide") }
+        if let enlargedSizeSlider { UserDefaults.standard.set(Double(normalizedEnlargedPreviewAmount(enlargedSizeSlider.doubleValue / 100)), forKey: "enlargedPreviewAmount") }
+        enlargedSizeLabel?.stringValue = "\(Int(enlargedPreviewAmount * 100))%"
         sizeLabel?.stringValue = "\(Int(previewWidth)) pt"
         opacityLabel?.stringValue = "\(Int(previewOpacity * 100))%"
         if demo { showDemo() }
@@ -1030,6 +1252,7 @@ if AppUpdater.runHelperIfRequested(configuration: glassDockUpdateConfiguration) 
     // The update helper finishes before the normal application is created.
 } else if CommandLine.arguments.contains("--self-test") {
     runSelfTests()
+    runNativePreviewSelfTests()
 } else if CommandLine.arguments.contains("--diagnostics") {
     print("GlassDock diagnostics")
     print("Accessibility: \(AXIsProcessTrusted())")
