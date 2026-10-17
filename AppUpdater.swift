@@ -116,14 +116,14 @@ enum AppUpdateCore {
         guard !release.draft, !release.prerelease else { throw AppUpdateFailure("GitHub вернул предварительный выпуск") }
         guard version > current else { throw AppUpdateFailure("Установлена актуальная версия \(installed)") }
         let plain = release.tag_name.hasPrefix("v") ? String(release.tag_name.dropFirst()) : release.tag_name
-        let name = "\(appName)-\(plain)-macOS-arm64.zip"
-        let matches = release.assets.filter { $0.name == name }
+        let names = ["\(appName)-\(plain)-macOS-arm64.zip", "\(appName)-\(plain).zip"]
+        let matches = release.assets.filter { names.contains($0.name) }
         guard matches.count == 1, let asset = matches.first, asset.size > 0, asset.size <= downloadLimit,
               let digest = asset.digest, digest.hasPrefix("sha256:"), digest.count == 71,
               digest.dropFirst(7).allSatisfy({ $0.isHexDigit }),
               let url = URL(string: asset.browser_download_url), url.scheme == "https", url.host == "github.com", url.port == nil,
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
-              url.path == "/\(repository)/releases/download/\(release.tag_name)/\(name)" else { throw AppUpdateFailure("В выпуске нет проверяемого ZIP для macOS arm64") }
+              url.path == "/\(repository)/releases/download/\(release.tag_name)/\(asset.name)" else { throw AppUpdateFailure("В выпуске нет проверяемого ZIP для macOS arm64") }
         return (plain, asset)
     }
     static func verifyDownload(_ data: Data, asset: AppUpdateRelease.Asset) throws {
@@ -164,8 +164,18 @@ enum AppUpdateCore {
                   let name = String(data: data[(cursor + 46)..<(cursor + 46 + nameLength)], encoding: .utf8) else { throw fail() }
             let directory = name.hasSuffix("/"), path = directory ? String(name.dropLast()) : name
             let components = path.split(separator: "/", omittingEmptySubsequences: false)
-            guard components.first == Substring(appName + ".app"), !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }),
-                  !path.contains("\\"), !path.contains(":"), !path.contains("\0"), !(components.count == 1 && !directory) else { throw fail() }
+            let metadata = components.first == "__MACOSX"
+            let appComponents = metadata ? Array(components.dropFirst()) : components
+            guard !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }),
+                  !path.contains("\\"), !path.contains(":"), !path.contains("\0") else { throw fail() }
+            if metadata {
+                // ditto stores AppleDouble sidecars here; validate but never install them.
+                guard (directory && appComponents.isEmpty) ||
+                      (appComponents.first == Substring(appName + ".app") &&
+                       (directory || (appComponents.count > 1 && appComponents.last!.hasPrefix("._")))) else { throw fail() }
+            } else {
+                guard appComponents.first == Substring(appName + ".app"), !(components.count == 1 && !directory) else { throw fail() }
+            }
             let key = path.precomposedStringWithCanonicalMapping.lowercased()
             guard names.insert(key).inserted else { throw fail() }
             if !directory { files.insert(key) }
@@ -204,6 +214,10 @@ enum AppUpdateCore {
         try fm.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         do {
             for entry in entries {
+                if entry.path == "__MACOSX" || entry.path.hasPrefix("__MACOSX/") {
+                    if !entry.directory { try inflateEntry(data, entry: entry) { _ in } }
+                    continue
+                }
                 let target = directory.appendingPathComponent(entry.path)
                 if entry.directory { try fm.createDirectory(at: target, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755]); continue }
                 try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])

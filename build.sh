@@ -22,8 +22,8 @@ cat > build/GlassDock.app/Contents/Info.plist <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.glassdock.app</string>
   <key>CFBundleName</key><string>GlassDock</string>
   <key>CFBundleDisplayName</key><string>GlassDock</string>
-  <key>CFBundleVersion</key><string>9</string>
-  <key>CFBundleShortVersionString</key><string>1.4.2</string>
+  <key>CFBundleVersion</key><string>10</string>
+  <key>CFBundleShortVersionString</key><string>1.4.3</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
